@@ -9,6 +9,7 @@ import { MOVE, WORLD } from '../../shared/config/world.js';
 import { WEAPONS, COMBAT, computeDamage, REGION } from '../../shared/config/weapons.js';
 import { MATCH, PHASE } from '../../shared/config/match.js';
 import { OBJECTIVE } from '../../shared/config/objective.js';
+import { ECON } from '../../shared/config/economy.js';
 import { aimDir, raycastPlayer } from '../../shared/combat/raycast.js';
 import { stepMovement } from '../../shared/movement/move.js';
 import { Player } from '../Player.js';
@@ -30,6 +31,8 @@ export class Room {
     this.winner = null;         // 'A' | 'D' once phase === over
     this.lastRoundWin = null;   // { winner, reason } for the round-end banner
     this.swapped = false;       // sides swapped at halftime?
+    this.lossStreakA = 0;       // consecutive round losses per side (economy)
+    this.lossStreakD = 0;
 
     // objective ("Breach Charge") state — owned by the server
     this.objective = this.freshObjective();
@@ -173,8 +176,19 @@ export class Room {
 
   startRound() {
     this.round += 1;
-    // fresh life + loadout for everyone
-    for (const p of this.players.values()) p.spawn();
+    // a fresh "pistol round" opens each half; otherwise survivors keep their
+    // weapon + armor and only players who died last round are reset to the
+    // starting loadout. Money always carries over (the economy lives in money).
+    const pistolRound = this.round === 1 || this.round === MATCH.halfRounds + 1;
+    for (const p of this.players.values()) {
+      if (pistolRound || !p.alive) {
+        p.weapon = ECON.startWeapon;
+        p.armor = ECON.startArmor;
+        p.helmet = false;
+      }
+      p.purchases = [];      // new buy phase -> refundable list resets
+      p.spawn();
+    }
     this.lastRoundWin = null;
     this.resetObjective();
     this.assignCarrier();
@@ -183,9 +197,23 @@ export class Room {
 
   endRound(winnerTeam, reason) {
     if (winnerTeam === 'A') this.scoreA += 1; else this.scoreD += 1;
+    this.awardRoundEconomy(winnerTeam);
     this.lastRoundWin = { winner: winnerTeam, reason };
     this.roundHistory.push({ round: this.round, winner: winnerTeam, reason });
     this.setPhase(PHASE.END, MATCH.endMs);
+  }
+
+  // team round-end money: winners get a flat reward, losers a streak-scaled
+  // consolation. Loss streak grows while a side keeps losing, resets on a win.
+  awardRoundEconomy(winnerTeam) {
+    const loserStreak = winnerTeam === 'A' ? this.lossStreakD : this.lossStreakA;
+    const lossReward = ECON.lossBase + Math.min(loserStreak, ECON.lossMaxSteps) * ECON.lossStep;
+    for (const p of this.players.values()) {
+      p.money += (p.team === winnerTeam) ? ECON.winReward : lossReward;
+      if (p.money > ECON.moneyCap) p.money = ECON.moneyCap;
+    }
+    if (winnerTeam === 'A') { this.lossStreakA = 0; this.lossStreakD += 1; }
+    else { this.lossStreakD = 0; this.lossStreakA += 1; }
   }
 
   advanceAfterRound() {
@@ -208,6 +236,7 @@ export class Room {
     this.swapped = true;
     for (const p of this.players.values()) p.team = p.team === 'A' ? 'D' : 'A';
     const tmp = this.scoreA; this.scoreA = this.scoreD; this.scoreD = tmp;
+    const ls = this.lossStreakA; this.lossStreakA = this.lossStreakD; this.lossStreakD = ls;
   }
 
   resetToWarmup() {
@@ -469,7 +498,7 @@ export class Room {
     }
 
     if (!hit) return;
-    const dmg = computeDamage(w, hit.region, hit.t, hit.target.armor);
+    const dmg = computeDamage(w, hit.region, hit.t, hit.target.armor, hit.target.helmet);
     const victim = hit.target;
     victim.armor = Math.max(0, victim.armor - dmg.armor);
     victim.hp -= dmg.hp;
@@ -488,6 +517,7 @@ export class Room {
       victim.interacting = false;
       if (victim.id === this.objective.carrier) this.dropCharge(victim);
       p.kills += 1;
+      p.money = Math.min(ECON.moneyCap, p.money + (ECON.killReward[p.weapon] ?? ECON.killRewardDefault));
       victim.deaths += 1;
       this.broadcast(S2C.DEATH_EVENT, {
         killer: id, killerName: p.name, victim: victim.id, victimName: victim.name,
@@ -509,6 +539,63 @@ export class Room {
     if (!w || p.reserve <= 0 || p.mag >= w.mag) return;
     p.reloading = true;
     p.reloadDoneAt = Date.now() + w.reloadMs;
+  }
+
+  // ---- economy / buy menu (server-authoritative) -------------------------
+  buyableInPhase() {
+    if (!ECON.buyOnlyInBuyPhase) return true;
+    return this.phase === PHASE.BUY || this.phase === PHASE.WARMUP;
+  }
+
+  // price + effect resolver for a buy item id
+  itemSpec(item) {
+    if (item === 'armor') return { price: ECON.armorPrice, kind: 'armor' };
+    if (item === 'armorhelmet') return { price: ECON.armorHelmetPrice, kind: 'armorhelmet' };
+    const w = WEAPONS[item];
+    if (w && w.price !== undefined) return { price: w.price, kind: 'weapon' };
+    return null;
+  }
+
+  onBuy(id, d) {
+    const p = this.players.get(id);
+    if (!p || !p.alive || !d) return;
+
+    // refund a previously-bought item this buy phase
+    if (d.refund) { this.refundItem(p, d.item); return; }
+
+    if (!this.buyableInPhase()) return this.sendTo(p, S2C.ECONOMY_UPDATE, { money: p.money, err: 'not buy phase' });
+    const spec = this.itemSpec(d.item);
+    if (!spec) return;
+    if (p.money < spec.price) return this.sendTo(p, S2C.ECONOMY_UPDATE, { money: p.money, err: 'too expensive' });
+
+    p.money -= spec.price;
+    if (spec.kind === 'weapon') {
+      const w = WEAPONS[d.item];
+      p.weapon = d.item;
+      p.mag = w.mag; p.reserve = w.reserve; p.reloading = false;
+    } else if (spec.kind === 'armor') {
+      p.armor = 100;
+    } else if (spec.kind === 'armorhelmet') {
+      p.armor = 100; p.helmet = true;
+    }
+    p.purchases.push({ item: d.item, price: spec.price });
+    this.sendTo(p, S2C.ECONOMY_UPDATE, { money: p.money, bought: d.item });
+  }
+
+  refundItem(p, item) {
+    if (!this.buyableInPhase()) return;
+    const idx = p.purchases.map((x) => x.item).lastIndexOf(item);
+    if (idx < 0) return;
+    const [bought] = p.purchases.splice(idx, 1);
+    p.money = Math.min(ECON.moneyCap, p.money + bought.price);
+    // revert effect
+    if (bought.item === 'armor' || bought.item === 'armorhelmet') { p.armor = 0; p.helmet = false; }
+    else if (WEAPONS[bought.item]) {
+      p.weapon = ECON.startWeapon;
+      const w = WEAPONS[p.weapon];
+      p.mag = w.mag; p.reserve = w.reserve;
+    }
+    this.sendTo(p, S2C.ECONOMY_UPDATE, { money: p.money, refunded: bought.item });
   }
 
   finishReload(p) {

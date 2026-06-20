@@ -74,14 +74,16 @@ export function falloffMul(w, dist) {
 }
 
 // final HP damage for a hit, accounting for region, falloff and armor.
-// returns { hp, armor } amounts to subtract.
-export function computeDamage(w, region, dist, targetArmor) {
+// returns { hp, armor } amounts to subtract. Armor absorbs body/leg hits always;
+// it only absorbs headshots when the target also has a helmet.
+export function computeDamage(w, region, dist, targetArmor, helmet) {
   let dmg = w.dmg;
   if (region === REGION.head) dmg *= w.headshotMult;
   else dmg *= (LIMB_MULT[region] || 1);
   dmg *= falloffMul(w, dist);
   let armorLoss = 0;
-  if (targetArmor > 0) {
+  const armorApplies = targetArmor > 0 && (region !== REGION.head || helmet);
+  if (armorApplies) {
     const absorbed = dmg * (1 - w.armorPen) * 0.5;
     dmg -= absorbed;
     armorLoss = Math.min(targetArmor, Math.round(absorbed));

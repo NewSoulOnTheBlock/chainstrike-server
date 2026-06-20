@@ -76,6 +76,10 @@ wss.on('connection', (ws) => {
         if (conn.room && conn.id) conn.room.onInteract(conn.id, d);
         break;
       }
+      case C2S.BUY_ITEM: {
+        if (conn.room && conn.id) conn.room.onBuy(conn.id, d);
+        break;
+      }
       case C2S.LEAVE_MATCH: {
         leave();
         break;

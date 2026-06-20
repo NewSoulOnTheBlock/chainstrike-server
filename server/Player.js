@@ -22,6 +22,7 @@ export class Player {
     // gameplay state (authoritative)
     this.hp = 100;
     this.armor = 0;
+    this.helmet = false;
     this.alive = true;
     this.respawnAt = 0;
 
@@ -38,6 +39,7 @@ export class Player {
     this.kills = 0; this.deaths = 0; this.assists = 0;
     this.money = 800;
     this.interacting = false;    // holding the plant/disarm key this tick
+    this.purchases = [];         // items bought this buy phase (for refunds)
 
     // lag-compensation hitbox history: [{ t, x, y, z, yaw }]
     this.history = [];
@@ -97,7 +99,7 @@ export class Player {
       x: round2(this.x), y: round2(this.y), z: round2(this.z),
       vx: round2(this.vx), vy: round2(this.vy), vz: round2(this.vz),
       yaw: round2(this.yaw), pitch: round2(this.pitch),
-      hp: this.hp, ar: this.armor, w: this.weapon,
+      hp: this.hp, ar: this.armor, hl: this.helmet ? 1 : 0, w: this.weapon,
       am: this.mag, rs: this.reserve, rl: this.reloading ? 1 : 0,
       a: this.alive ? 1 : 0,
       k: this.kills, d: this.deaths,
