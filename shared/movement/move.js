@@ -7,9 +7,27 @@
 // input: { move:{x,z} (-1..1, local to yaw), yaw, buttons (BTN bitmask) }
 import { WORLD, MOVE } from '../config/world.js';
 import { BTN } from '../net/protocol.js';
-import { MAP, COLLIDERS } from '../config/mapColliders.js';
+import { MAP, COLLIDERS, RAMPS } from '../config/mapColliders.js';
 
 const STEP_HEIGHT = 0.55;   // max ledge the controller auto-steps onto
+
+// Ride walkable ramp slopes: if the player is over a ramp footprint and the
+// interpolated surface is within stepping range, snap them onto it so they
+// flow smoothly up/down. Shared by client prediction and server authority.
+function resolveRamps(s) {
+  const PR = WORLD.playerRadius;
+  for (let i = 0; i < RAMPS.length; i++) {
+    const r = RAMPS[i];
+    if (s.x <= r.minX - PR || s.x >= r.maxX + PR) continue;
+    if (s.z <= r.minZ - PR || s.z >= r.maxZ + PR) continue;
+    let t = r.axis === 'x' ? (s.x - r.minX) / (r.maxX - r.minX) : (s.z - r.minZ) / (r.maxZ - r.minZ);
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    const surf = r.y0 + t * (r.y1 - r.y0);
+    if (surf - s.y <= STEP_HEIGHT && surf - s.y > -0.6 && s.vy <= 0.001) {
+      s.y = surf; s.vy = 0; s.grounded = true;
+    }
+  }
+}
 
 // Resolve the player capsule (approximated as a vertical AABB of half-width
 // playerRadius and height playerHeight) against the solid map colliders.
@@ -100,6 +118,9 @@ export function stepMovement(s, input, dt) {
 
   // ground plane
   if (s.y <= WORLD.spawnY) { s.y = WORLD.spawnY; s.vy = 0; s.grounded = true; }
+
+  // walkable ramp slopes (smooth up/down)
+  resolveRamps(s);
 
   // solid map cover (crates / pillars / walls) — server-authoritative
   resolveColliders(s);
