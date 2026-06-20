@@ -79,12 +79,19 @@ export class Room {
     if (!p) return;
     p.lastSeenAt = Date.now();
     if (!input || typeof input.seq !== 'number') return;
-    // drop inputs that are too old or implausibly in the future
     const now = Date.now();
+    // Client and server wall clocks are NOT synchronized, so we cannot compare
+    // input.t to `now` directly. Instead we learn a per-client offset from the
+    // first input (and slowly track it), then judge each input's age relative to
+    // that offset. This keeps the stale/future-packet guard meaningful without
+    // a separate clock-sync handshake.
     if (typeof input.t === 'number') {
-      const dtMs = input.t - now;
-      if (dtMs > MAX_INPUT_AHEAD_MS) return;
-      if (dtMs < -MAX_INPUT_AGE_MS) return;
+      const raw = now - input.t;
+      if (p.clockOffset === null) p.clockOffset = raw;
+      else p.clockOffset += (raw - p.clockOffset) * 0.02; // gentle drift tracking
+      const age = raw - p.clockOffset; // ~0 for on-time packets
+      if (age > MAX_INPUT_AGE_MS) return;        // arrived far too late
+      if (age < -MAX_INPUT_AHEAD_MS) return;     // implausibly in the future
     }
     if (input.seq <= p.lastSeq) return; // already processed / duplicate
     const q = this.inputs.get(id);

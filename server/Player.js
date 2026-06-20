@@ -28,6 +28,7 @@ export class Player {
     this.lastSeq = 0;            // last processed input sequence
     this.lastInputAt = Date.now();
     this.lastSeenAt = Date.now();
+    this.clockOffset = null;     // learned (serverNow - clientInputTime) offset
     this.ping = 0;
     this.slot = _slot++;        // stable spawn ordering
   }
