@@ -12,6 +12,7 @@ import { OBJECTIVE } from '../../shared/config/objective.js';
 import { ECON } from '../../shared/config/economy.js';
 import { GRENADES, GRENADE_STARTER, THROW, freshGrenades } from '../../shared/config/grenades.js';
 import { aimDir, raycastPlayer } from '../../shared/combat/raycast.js';
+import { raycastWorld } from '../../shared/combat/worldRaycast.js';
 import { stepMovement } from '../../shared/movement/move.js';
 import { Player } from '../Player.js';
 
@@ -509,6 +510,9 @@ export class Room {
     }
 
     if (!hit) return;
+    // world occlusion: a wall/cover between shooter and target stops the bullet
+    const wallT = raycastWorld(ox, oy, oz, d.x, d.y, d.z, w.range || Infinity);
+    if (wallT < hit.t) return; // shot blocked by solid geometry
     const dmg = computeDamage(w, hit.region, hit.t, hit.target.armor, hit.target.helmet);
     const victim = hit.target;
     victim.armor = Math.max(0, victim.armor - dmg.armor);
