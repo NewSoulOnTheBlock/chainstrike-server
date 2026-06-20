@@ -7,6 +7,7 @@ import {
 } from '../../shared/net/protocol.js';
 import { MOVE } from '../../shared/config/world.js';
 import { WEAPONS, COMBAT, computeDamage, REGION } from '../../shared/config/weapons.js';
+import { MATCH, PHASE } from '../../shared/config/match.js';
 import { aimDir, raycastPlayer } from '../../shared/combat/raycast.js';
 import { stepMovement } from '../../shared/movement/move.js';
 import { Player } from '../Player.js';
@@ -17,7 +18,18 @@ export class Room {
     this.players = new Map();   // playerId -> Player
     this.inputs = new Map();    // playerId -> queued input array
     this.tick = 0;
-    this.phase = 'waiting';     // waiting | warmup | buy | live | over
+
+    // round / match state
+    this.phase = PHASE.WARMUP;
+    this.phaseEndsAt = Date.now() + MATCH.warmupMs;
+    this.round = 0;
+    this.scoreA = 0;            // score for the team CURRENTLY playing as A's side
+    this.scoreD = 0;
+    this.roundHistory = [];     // [{ round, winner, reason }]
+    this.winner = null;         // 'A' | 'D' once phase === over
+    this.lastRoundWin = null;   // { winner, reason } for the round-end banner
+    this.swapped = false;       // sides swapped at halftime?
+
     this.startedAt = Date.now();
     this._loop = null;
     this.start();
@@ -53,6 +65,9 @@ export class Room {
   addPlayer(id, name, team, ws) {
     const p = new Player(id, name, team, ws);
     p.spawn();
+    p.money = MATCH.startMoney;
+    // joining mid-round? sit out (dead) until the next round starts
+    if (this.phase === PHASE.LIVE) p.alive = false;
     this.players.set(id, p);
     this.inputs.set(id, []);
     // tell the newcomer who they are + current roster
@@ -121,8 +136,8 @@ export class Room {
 
       // finish a pending reload
       if (p.reloading && now >= p.reloadDoneAt) this.finishReload(p);
-      // auto-respawn (Phase 5 replaces this with round logic)
-      if (!p.alive && p.respawnAt && now >= p.respawnAt) {
+      // free practice respawns ONLY in warmup; rounds control life otherwise
+      if (this.phase === PHASE.WARMUP && !p.alive && p.respawnAt && now >= p.respawnAt) {
         p.spawn();
         this.broadcast(S2C.RESPAWN, { id: p.id, x: p.x, y: p.y, z: p.z });
       }
@@ -130,15 +145,132 @@ export class Room {
       p.recordHistory(now);
     }
 
+    this.updateRounds(now);
+
     if (this.tick % SNAPSHOT_EVERY === 0) this.sendSnapshot();
+  }
+
+  // ---- round / match state machine --------------------------------------
+  teamCounts() {
+    let a = 0, d = 0, aliveA = 0, aliveD = 0;
+    for (const p of this.players.values()) {
+      if (p.team === 'A') { a++; if (p.alive) aliveA++; }
+      else { d++; if (p.alive) aliveD++; }
+    }
+    return { a, d, aliveA, aliveD };
+  }
+
+  setPhase(phase, durMs) {
+    this.phase = phase;
+    this.phaseEndsAt = Date.now() + durMs;
+    this.broadcastRoundState();
+  }
+
+  startRound() {
+    this.round += 1;
+    // fresh life + loadout for everyone
+    for (const p of this.players.values()) p.spawn();
+    this.lastRoundWin = null;
+    this.setPhase(PHASE.BUY, MATCH.buyMs);
+  }
+
+  endRound(winnerTeam, reason) {
+    if (winnerTeam === 'A') this.scoreA += 1; else this.scoreD += 1;
+    this.lastRoundWin = { winner: winnerTeam, reason };
+    this.roundHistory.push({ round: this.round, winner: winnerTeam, reason });
+    this.setPhase(PHASE.END, MATCH.endMs);
+  }
+
+  advanceAfterRound() {
+    // match win?
+    if (this.scoreA >= MATCH.winScore || this.scoreD >= MATCH.winScore) {
+      this.winner = this.scoreA > this.scoreD ? 'A' : 'D';
+      this.setPhase(PHASE.OVER, 3600000);
+      return;
+    }
+    // halftime swap after the first half
+    if (!this.swapped && this.round >= MATCH.halfRounds) {
+      this.swapSides();
+      this.setPhase(PHASE.HALFTIME, MATCH.halftimeMs);
+      return;
+    }
+    this.startRound();
+  }
+
+  swapSides() {
+    this.swapped = true;
+    for (const p of this.players.values()) p.team = p.team === 'A' ? 'D' : 'A';
+    const tmp = this.scoreA; this.scoreA = this.scoreD; this.scoreD = tmp;
+  }
+
+  resetToWarmup() {
+    this.phase = PHASE.WARMUP;
+    this.phaseEndsAt = Date.now() + MATCH.warmupMs;
+    this.round = 0; this.scoreA = 0; this.scoreD = 0;
+    this.roundHistory = []; this.winner = null; this.lastRoundWin = null; this.swapped = false;
+    for (const p of this.players.values()) p.spawn();
+    this.broadcastRoundState();
+  }
+
+  updateRounds(now) {
+    const c = this.teamCounts();
+    const bothTeams = c.a >= 1 && c.d >= 1;
+
+    switch (this.phase) {
+      case PHASE.WARMUP:
+        if (bothTeams && now >= this.phaseEndsAt) this.startRound();
+        else if (bothTeams && this.phaseEndsAt - now > MATCH.warmupMs) this.phaseEndsAt = now + MATCH.warmupMs;
+        break;
+      case PHASE.BUY:
+        if (!bothTeams) { this.resetToWarmup(); break; }
+        if (now >= this.phaseEndsAt) this.setPhase(PHASE.LIVE, MATCH.liveMs);
+        break;
+      case PHASE.LIVE:
+        if (!bothTeams) { this.resetToWarmup(); break; }
+        if (c.aliveA === 0 && c.aliveD === 0) this.endRound('D', 'draw');
+        else if (c.aliveA === 0) this.endRound('D', 'elimination');
+        else if (c.aliveD === 0) this.endRound('A', 'elimination');
+        else if (now >= this.phaseEndsAt) this.endRound('D', 'timeout'); // defenders hold
+        break;
+      case PHASE.END:
+        if (now >= this.phaseEndsAt) this.advanceAfterRound();
+        break;
+      case PHASE.HALFTIME:
+        if (now >= this.phaseEndsAt) this.startRound();
+        break;
+      case PHASE.OVER:
+        // idle on the result; a fresh room is created when this one empties
+        break;
+      default:
+        break;
+    }
+  }
+
+  broadcastRoundState() {
+    this.broadcast(S2C.ROUND_STATE, this.roundStatePayload());
+  }
+  roundStatePayload() {
+    const c = this.teamCounts();
+    return {
+      phase: this.phase, round: this.round,
+      scoreA: this.scoreA, scoreD: this.scoreD,
+      phaseEndsAt: this.phaseEndsAt, now: Date.now(),
+      aliveA: c.aliveA, aliveD: c.aliveD,
+      winner: this.winner, lastRoundWin: this.lastRoundWin,
+      maxRounds: MATCH.maxRounds, winScore: MATCH.winScore,
+    };
   }
 
   applyInput(p, inp, dt) {
     if (!p.alive) return;
     if (typeof inp.yaw === 'number') p.yaw = inp.yaw;
     if (typeof inp.pitch === 'number') p.pitch = clamp(inp.pitch, -1.55, 1.55);
+    // frozen during the buy/halftime phase: aim only, no movement
+    const frozen = this.phase === PHASE.BUY || this.phase === PHASE.HALFTIME;
+    const move = frozen ? { x: 0, z: 0 } : inp.move;
+    const buttons = frozen ? 0 : inp.buttons;
     const before = { x: p.x, z: p.z };
-    stepMovement(p, { move: inp.move, yaw: p.yaw, buttons: inp.buttons }, dt);
+    stepMovement(p, { move, yaw: p.yaw, buttons }, dt);
     // anti-cheat: clamp impossible horizontal displacement for one tick
     const maxStep = (p.grounded ? MOVE.maxSpeedHardCap : MOVE.maxAirSpeedCap) * dt + 0.05;
     const moved = Math.hypot(p.x - before.x, p.z - before.z);
@@ -155,6 +287,8 @@ export class Room {
   onFire(id) {
     const p = this.players.get(id);
     if (!p || !p.alive || p.reloading) return;
+    // can only shoot in a live round (or warmup practice)
+    if (this.phase !== PHASE.LIVE && this.phase !== PHASE.WARMUP) return;
     const w = WEAPONS[p.weapon];
     if (!w) return;
     const now = Date.now();
@@ -236,6 +370,10 @@ export class Room {
       tick: this.tick,
       ts: Date.now(),
       phase: this.phase,
+      round: this.round,
+      scoreA: this.scoreA, scoreD: this.scoreD,
+      pEnd: this.phaseEndsAt,
+      winner: this.winner,
       players: [...this.players.values()].map((p) => p.toSnapshot()),
     };
     const msg = encode(S2C.MATCH_SNAPSHOT, snap);

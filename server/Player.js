@@ -36,6 +36,7 @@ export class Player {
 
     // stats
     this.kills = 0; this.deaths = 0; this.assists = 0;
+    this.money = 800;
 
     // lag-compensation hitbox history: [{ t, x, y, z, yaw }]
     this.history = [];
@@ -98,6 +99,7 @@ export class Player {
       am: this.mag, rs: this.reserve, rl: this.reloading ? 1 : 0,
       a: this.alive ? 1 : 0,
       k: this.kills, d: this.deaths,
+      nm: this.name, mny: this.money,
       seq: this.lastSeq, // so the client knows what input this state reflects
     };
   }
