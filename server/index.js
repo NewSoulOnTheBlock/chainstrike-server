@@ -64,6 +64,14 @@ wss.on('connection', (ws) => {
         if (conn.room && conn.id) conn.room.queueInput(conn.id, d);
         break;
       }
+      case C2S.FIRE_WEAPON: {
+        if (conn.room && conn.id) conn.room.onFire(conn.id, d);
+        break;
+      }
+      case C2S.RELOAD_WEAPON: {
+        if (conn.room && conn.id) conn.room.onReload(conn.id, d);
+        break;
+      }
       case C2S.LEAVE_MATCH: {
         leave();
         break;

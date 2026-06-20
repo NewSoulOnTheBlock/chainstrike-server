@@ -41,6 +41,8 @@ export const S2C = {
   PLAYER_STATE: 'player_state',
   DAMAGE_EVENT: 'damage_event',
   DEATH_EVENT: 'death_event',
+  SHOT: 'shot',                 // a player fired (for remote tracers/muzzle fx)
+  RESPAWN: 'respawn',
   ROUND_STATE: 'round_state',
   ECONOMY_UPDATE: 'economy_update',
   INVENTORY_UPDATE: 'inventory_update',

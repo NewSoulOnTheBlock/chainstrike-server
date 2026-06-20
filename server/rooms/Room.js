@@ -6,6 +6,8 @@ import {
   MAX_INPUT_AHEAD_MS, MAX_INPUT_AGE_MS,
 } from '../../shared/net/protocol.js';
 import { MOVE } from '../../shared/config/world.js';
+import { WEAPONS, COMBAT, computeDamage, REGION } from '../../shared/config/weapons.js';
+import { aimDir, raycastPlayer } from '../../shared/combat/raycast.js';
 import { stepMovement } from '../../shared/movement/move.js';
 import { Player } from '../Player.js';
 
@@ -102,18 +104,30 @@ export class Room {
   // ---- fixed-step simulation --------------------------------------------
   step(dt) {
     this.tick++;
+    const now = Date.now();
 
     for (const p of this.players.values()) {
       const q = this.inputs.get(p.id);
-      if (!q || q.length === 0) continue;
-      // process every queued input in sequence order this tick
-      q.sort((a, b) => a.seq - b.seq);
-      for (const inp of q) {
-        if (inp.seq <= p.lastSeq) continue;
-        this.applyInput(p, inp, dt);
-        p.lastSeq = inp.seq;
+      if (q && q.length) {
+        // process every queued input in sequence order this tick
+        q.sort((a, b) => a.seq - b.seq);
+        for (const inp of q) {
+          if (inp.seq <= p.lastSeq) continue;
+          this.applyInput(p, inp, dt);
+          p.lastSeq = inp.seq;
+        }
+        q.length = 0;
       }
-      q.length = 0;
+
+      // finish a pending reload
+      if (p.reloading && now >= p.reloadDoneAt) this.finishReload(p);
+      // auto-respawn (Phase 5 replaces this with round logic)
+      if (!p.alive && p.respawnAt && now >= p.respawnAt) {
+        p.spawn();
+        this.broadcast(S2C.RESPAWN, { id: p.id, x: p.x, y: p.y, z: p.z });
+      }
+      // record a lag-compensation hitbox sample AFTER movement this tick
+      p.recordHistory(now);
     }
 
     if (this.tick % SNAPSHOT_EVERY === 0) this.sendSnapshot();
@@ -135,7 +149,88 @@ export class Room {
     }
   }
 
-  // ---- outbound ----------------------------------------------------------
+  // ---- combat (server-authoritative hitscan + lag compensation) ----------
+  // Client sends only the intent to fire; the server uses its OWN authoritative
+  // yaw/pitch for the ray (never trusts client aim) and validates ammo/cooldown.
+  onFire(id) {
+    const p = this.players.get(id);
+    if (!p || !p.alive || p.reloading) return;
+    const w = WEAPONS[p.weapon];
+    if (!w) return;
+    const now = Date.now();
+    if (now - p.lastFireAt < w.fireDelayMs) return; // fire-rate validation
+    if (p.mag <= 0) return;                          // ammo validation
+    p.lastFireAt = now;
+    p.mag -= 1;
+
+    const ox = p.x, oy = p.y + COMBAT.eyeHeight, oz = p.z;
+    const d = aimDir(p.yaw, p.pitch);
+    // tell everyone else this player fired (remote tracer/muzzle fx)
+    this.broadcast(S2C.SHOT, { id, ox, oy, oz, dx: d.x, dy: d.y, dz: d.z, w: p.weapon }, id);
+
+    // lag compensation: rewind every target to where the shooter likely saw it
+    const rewind = clamp(p.ping * 0.5 + COMBAT.interpDelayMs, 0, COMBAT.maxRewindMs);
+    const shotTime = now - rewind;
+
+    let hit = null; // { target, t, region }
+    for (const t of this.players.values()) {
+      if (t.id === id || !t.alive || t.team === p.team) continue; // no FF for now
+      const sample = t.sampleAt(shotTime);
+      const r = raycastPlayer(ox, oy, oz, d.x, d.y, d.z, sample);
+      if (r && (!hit || r.t < hit.t)) hit = { target: t, t: r.t, region: r.region };
+    }
+
+    if (!hit) return;
+    const dmg = computeDamage(w, hit.region, hit.t, hit.target.armor);
+    const victim = hit.target;
+    victim.armor = Math.max(0, victim.armor - dmg.armor);
+    victim.hp -= dmg.hp;
+    const head = hit.region === REGION.head;
+
+    // hit confirmation to the shooter
+    this.sendTo(p, S2C.DAMAGE_EVENT, {
+      confirm: true, target: victim.id, region: hit.region, amount: dmg.hp,
+      lethal: victim.hp <= 0 ? 1 : 0, head: head ? 1 : 0,
+    });
+
+    if (victim.hp <= 0) {
+      victim.hp = 0;
+      victim.alive = false;
+      victim.respawnAt = now + COMBAT.respawnMs;
+      p.kills += 1;
+      victim.deaths += 1;
+      this.broadcast(S2C.DEATH_EVENT, {
+        killer: id, killerName: p.name, victim: victim.id, victimName: victim.name,
+        weapon: p.weapon, head: head ? 1 : 0,
+      });
+    } else {
+      // damage indicator to the victim
+      this.sendTo(victim, S2C.DAMAGE_EVENT, {
+        victim: victim.id, amount: dmg.hp, hp: victim.hp, armor: victim.armor,
+        from: id, region: hit.region,
+      });
+    }
+  }
+
+  onReload(id) {
+    const p = this.players.get(id);
+    if (!p || !p.alive || p.reloading) return;
+    const w = WEAPONS[p.weapon];
+    if (!w || p.reserve <= 0 || p.mag >= w.mag) return;
+    p.reloading = true;
+    p.reloadDoneAt = Date.now() + w.reloadMs;
+  }
+
+  finishReload(p) {
+    const w = WEAPONS[p.weapon];
+    const need = w.mag - p.mag;
+    const take = Math.min(need, p.reserve);
+    p.mag += take;
+    p.reserve -= take;
+    p.reloading = false;
+  }
+
+
   sendSnapshot() {
     const snap = {
       tick: this.tick,
