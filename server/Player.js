@@ -37,6 +37,7 @@ export class Player {
     // stats
     this.kills = 0; this.deaths = 0; this.assists = 0;
     this.money = 800;
+    this.interacting = false;    // holding the plant/disarm key this tick
 
     // lag-compensation hitbox history: [{ t, x, y, z, yaw }]
     this.history = [];
@@ -66,6 +67,7 @@ export class Player {
     this.reserve = w.reserve;
     this.reloading = false;
     this.history.length = 0;
+    this.interacting = false;
   }
 
   // record a hitbox-history sample for lag compensation, trimming old entries

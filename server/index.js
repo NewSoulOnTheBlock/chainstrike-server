@@ -72,6 +72,10 @@ wss.on('connection', (ws) => {
         if (conn.room && conn.id) conn.room.onReload(conn.id, d);
         break;
       }
+      case C2S.INTERACT_OBJECTIVE: {
+        if (conn.room && conn.id) conn.room.onInteract(conn.id, d);
+        break;
+      }
       case C2S.LEAVE_MATCH: {
         leave();
         break;

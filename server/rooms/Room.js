@@ -5,9 +5,10 @@ import {
   S2C, TICK_DT, TICK_HZ, SNAPSHOT_EVERY, encode,
   MAX_INPUT_AHEAD_MS, MAX_INPUT_AGE_MS,
 } from '../../shared/net/protocol.js';
-import { MOVE } from '../../shared/config/world.js';
+import { MOVE, WORLD } from '../../shared/config/world.js';
 import { WEAPONS, COMBAT, computeDamage, REGION } from '../../shared/config/weapons.js';
 import { MATCH, PHASE } from '../../shared/config/match.js';
+import { OBJECTIVE } from '../../shared/config/objective.js';
 import { aimDir, raycastPlayer } from '../../shared/combat/raycast.js';
 import { stepMovement } from '../../shared/movement/move.js';
 import { Player } from '../Player.js';
@@ -29,6 +30,9 @@ export class Room {
     this.winner = null;         // 'A' | 'D' once phase === over
     this.lastRoundWin = null;   // { winner, reason } for the round-end banner
     this.swapped = false;       // sides swapped at halftime?
+
+    // objective ("Breach Charge") state — owned by the server
+    this.objective = this.freshObjective();
 
     this.startedAt = Date.now();
     this._loop = null;
@@ -85,6 +89,7 @@ export class Room {
   removePlayer(id) {
     const p = this.players.get(id);
     if (!p) return;
+    if (this.objective.carrier === id && !this.objective.planted) this.dropCharge(p);
     this.players.delete(id);
     this.inputs.delete(id);
     this.broadcast(S2C.PLAYER_LEFT, { id });
@@ -171,6 +176,8 @@ export class Room {
     // fresh life + loadout for everyone
     for (const p of this.players.values()) p.spawn();
     this.lastRoundWin = null;
+    this.resetObjective();
+    this.assignCarrier();
     this.setPhase(PHASE.BUY, MATCH.buyMs);
   }
 
@@ -209,6 +216,7 @@ export class Room {
     this.round = 0; this.scoreA = 0; this.scoreD = 0;
     this.roundHistory = []; this.winner = null; this.lastRoundWin = null; this.swapped = false;
     for (const p of this.players.values()) p.spawn();
+    this.resetObjective();
     this.broadcastRoundState();
   }
 
@@ -225,13 +233,23 @@ export class Room {
         if (!bothTeams) { this.resetToWarmup(); break; }
         if (now >= this.phaseEndsAt) this.setPhase(PHASE.LIVE, MATCH.liveMs);
         break;
-      case PHASE.LIVE:
+      case PHASE.LIVE: {
         if (!bothTeams) { this.resetToWarmup(); break; }
-        if (c.aliveA === 0 && c.aliveD === 0) this.endRound('D', 'draw');
-        else if (c.aliveA === 0) this.endRound('D', 'elimination');
-        else if (c.aliveD === 0) this.endRound('A', 'elimination');
-        else if (now >= this.phaseEndsAt) this.endRound('D', 'timeout'); // defenders hold
+        this.tickObjective(now);
+        if (this.phase !== PHASE.LIVE) break; // tickObjective may have ended the round
+        const o = this.objective;
+        if (o.planted) {
+          // charge is armed: defenders must disarm or die; the live timer no
+          // longer saves them. Wiping the defenders wins it for attackers.
+          if (c.aliveD === 0) this.endRound('A', 'elimination');
+        } else {
+          if (c.aliveA === 0 && c.aliveD === 0) this.endRound('D', 'draw');
+          else if (c.aliveA === 0) this.endRound('D', 'elimination');
+          else if (c.aliveD === 0) this.endRound('A', 'elimination');
+          else if (now >= this.phaseEndsAt) this.endRound('D', 'timeout'); // defenders hold
+        }
         break;
+      }
       case PHASE.END:
         if (now >= this.phaseEndsAt) this.advanceAfterRound();
         break;
@@ -258,6 +276,142 @@ export class Room {
       aliveA: c.aliveA, aliveD: c.aliveD,
       winner: this.winner, lastRoundWin: this.lastRoundWin,
       maxRounds: MATCH.maxRounds, winScore: MATCH.winScore,
+    };
+  }
+
+  // ---- objective ("Breach Charge") --------------------------------------
+  freshObjective() {
+    return {
+      carrier: null,       // id of the attacker holding the charge
+      dropped: null,       // { x, y, z } when lying on the ground
+      planted: false,
+      plantPos: null,      // { x, y, z } once armed
+      site: null,          // 'A' | 'B'
+      detonateAt: 0,
+      plantBy: null, plantStart: 0,    // an arm in progress
+      defuseBy: null, defuseStart: 0,  // a disarm in progress
+      plantedBy: null, defusedBy: null,
+    };
+  }
+
+  resetObjective() {
+    this.objective = this.freshObjective();
+    for (const p of this.players.values()) p.interacting = false;
+  }
+
+  // hand the charge to the first alive attacker each round
+  assignCarrier() {
+    let chosen = null;
+    for (const p of this.players.values()) {
+      if (p.team === 'A' && p.alive) { chosen = p; break; }
+    }
+    this.objective.carrier = chosen ? chosen.id : null;
+  }
+
+  siteAt(x, z) {
+    for (const s of OBJECTIVE.sites) {
+      if (Math.hypot(x - s.x, z - s.z) <= s.r) return s;
+    }
+    return null;
+  }
+
+  dropCharge(p) {
+    const o = this.objective;
+    if (o.planted || o.carrier !== p.id) return;
+    o.carrier = null;
+    o.dropped = { x: p.x, y: WORLD.spawnY, z: p.z };
+    o.plantBy = null;
+    this.broadcast(S2C.OBJECTIVE_UPDATE, { event: 'dropped', x: round2(p.x), z: round2(p.z) });
+  }
+
+  onInteract(id, d) {
+    const p = this.players.get(id);
+    if (!p || !p.alive) return;
+    p.interacting = !!(d && d.hold);
+  }
+
+  tickObjective(now) {
+    const o = this.objective;
+    if (this.phase !== PHASE.LIVE) { o.plantBy = null; o.defuseBy = null; return; }
+
+    // 1) detonation wins the round for attackers
+    if (o.planted) {
+      if (now >= o.detonateAt) { this.endRound('A', 'detonation'); return; }
+    } else {
+      // 2) an attacker walking over a dropped charge collects it
+      if (o.dropped && !o.carrier) {
+        for (const p of this.players.values()) {
+          if (p.team !== 'A' || !p.alive) continue;
+          if (Math.hypot(p.x - o.dropped.x, p.z - o.dropped.z) <= OBJECTIVE.pickupRadius) {
+            o.carrier = p.id; o.dropped = null;
+            this.broadcast(S2C.OBJECTIVE_UPDATE, { event: 'pickup', by: p.id });
+            break;
+          }
+        }
+      }
+      // 3) arming progress (carrier holding interact inside a site zone)
+      const c = o.carrier && this.players.get(o.carrier);
+      const site = c && c.alive ? this.siteAt(c.x, c.z) : null;
+      if (c && c.alive && c.interacting && site) {
+        if (o.plantBy !== c.id) { o.plantBy = c.id; o.plantStart = now; }
+        if (now - o.plantStart >= OBJECTIVE.plantTimeMs) this.completePlant(c, site, now);
+      } else {
+        o.plantBy = null;
+      }
+      return;
+    }
+
+    // 4) disarm progress (a defender holding interact near the armed charge)
+    let actor = null;
+    for (const p of this.players.values()) {
+      if (p.team !== 'D' || !p.alive || !p.interacting) continue;
+      if (Math.hypot(p.x - o.plantPos.x, p.z - o.plantPos.z) <= OBJECTIVE.defuseRadius) { actor = p; break; }
+    }
+    if (actor) {
+      if (o.defuseBy !== actor.id) { o.defuseBy = actor.id; o.defuseStart = now; }
+      if (now - o.defuseStart >= OBJECTIVE.defuseTimeMs) this.completeDefuse(actor);
+    } else {
+      o.defuseBy = null;
+    }
+  }
+
+  completePlant(c, site, now) {
+    const o = this.objective;
+    o.planted = true;
+    o.carrier = null;
+    o.plantPos = { x: c.x, y: WORLD.spawnY, z: c.z };
+    o.site = site.id;
+    o.detonateAt = now + OBJECTIVE.detonateMs;
+    o.plantedBy = c.id;
+    o.plantBy = null;
+    c.money += OBJECTIVE.plantBonus;
+    c.interacting = false;
+    this.broadcast(S2C.OBJECTIVE_UPDATE, {
+      event: 'planted', site: site.id, by: c.id,
+      x: round2(o.plantPos.x), z: round2(o.plantPos.z), detonateAt: o.detonateAt,
+    });
+    this.broadcastRoundState();
+  }
+
+  completeDefuse(p) {
+    const o = this.objective;
+    o.defusedBy = p.id;
+    o.defuseBy = null;
+    p.money += OBJECTIVE.defuseBonus;
+    this.broadcast(S2C.OBJECTIVE_UPDATE, { event: 'defused', by: p.id });
+    this.endRound('D', 'defuse');
+  }
+
+  objectiveSnapshot(now) {
+    const o = this.objective;
+    let pp = 0, df = 0;
+    if (o.plantBy) pp = clamp((now - o.plantStart) / OBJECTIVE.plantTimeMs, 0, 1);
+    if (o.defuseBy) df = clamp((now - o.defuseStart) / OBJECTIVE.defuseTimeMs, 0, 1);
+    return {
+      c: o.carrier, dr: o.dropped ? { x: round2(o.dropped.x), z: round2(o.dropped.z) } : null,
+      pl: o.planted ? 1 : 0, st: o.site,
+      px: o.plantPos ? round2(o.plantPos.x) : 0, pz: o.plantPos ? round2(o.plantPos.z) : 0,
+      dt: o.detonateAt, pp: round2(pp), df: round2(df),
     };
   }
 
@@ -331,6 +485,8 @@ export class Room {
       victim.hp = 0;
       victim.alive = false;
       victim.respawnAt = now + COMBAT.respawnMs;
+      victim.interacting = false;
+      if (victim.id === this.objective.carrier) this.dropCharge(victim);
       p.kills += 1;
       victim.deaths += 1;
       this.broadcast(S2C.DEATH_EVENT, {
@@ -374,6 +530,7 @@ export class Room {
       scoreA: this.scoreA, scoreD: this.scoreD,
       pEnd: this.phaseEndsAt,
       winner: this.winner,
+      obj: this.objectiveSnapshot(Date.now()),
       players: [...this.players.values()].map((p) => p.toSnapshot()),
     };
     const msg = encode(S2C.MATCH_SNAPSHOT, snap);
@@ -392,6 +549,7 @@ export class Room {
 }
 
 function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+function round2(n) { return Math.round(n * 100) / 100; }
 function safeSend(ws, msg) {
   try { if (ws && ws.readyState === 1) ws.send(msg); } catch { /* ignore */ }
 }
