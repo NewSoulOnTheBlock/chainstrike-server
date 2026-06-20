@@ -29,6 +29,7 @@ export const C2S = {
   SWITCH_WEAPON: 'switch_weapon',
   BUY_ITEM: 'buy_item',
   DROP_WEAPON: 'drop_weapon',
+  THROW_GRENADE: 'throw_grenade',
   INTERACT_OBJECTIVE: 'interact_objective',
   CHAT_MESSAGE: 'chat_message',
   PING: 'ping',
@@ -47,6 +48,7 @@ export const S2C = {
   ECONOMY_UPDATE: 'economy_update',
   INVENTORY_UPDATE: 'inventory_update',
   OBJECTIVE_UPDATE: 'objective_update',
+  GRENADE_EVENT: 'grenade_event',   // throw / bounce / detonate / flash / smoke / fire
   CHAT_MESSAGE: 'chat_message',
   PLAYER_JOINED: 'player_joined',
   PLAYER_LEFT: 'player_left',

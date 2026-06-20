@@ -35,4 +35,10 @@ export const BUY_MENU = [
     { id: 'armor', key: '6', name: 'Body Armor', price: 650 },
     { id: 'armorhelmet', key: '7', name: 'Armor + Helmet', price: 1000 },
   ] },
+  { cat: 'Grenades', items: [
+    { id: 'nade_flash', key: '8', name: 'Flash', price: 200 },
+    { id: 'nade_smoke', key: '9', name: 'Smoke', price: 250 },
+    { id: 'nade_frag', key: '0', name: 'Fragmentation', price: 300 },
+    { id: 'nade_fire', key: '-', name: 'Incendiary', price: 350 },
+  ] },
 ];

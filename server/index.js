@@ -80,6 +80,10 @@ wss.on('connection', (ws) => {
         if (conn.room && conn.id) conn.room.onBuy(conn.id, d);
         break;
       }
+      case C2S.THROW_GRENADE: {
+        if (conn.room && conn.id) conn.room.onThrow(conn.id, d);
+        break;
+      }
       case C2S.LEAVE_MATCH: {
         leave();
         break;

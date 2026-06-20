@@ -7,8 +7,8 @@ export const WORLD = {
   playerHeight: 1.8,
   playerRadius: 0.4,
   spawnY: 0,
-  arenaHalfX: 24,       // matches the procedural map ARENA bounds
-  arenaHalfZ: 34,
+  arenaHalfX: 12.75,    // matches the GLB map (tdm_arena) footprint
+  arenaHalfZ: 24.6,
 };
 
 export const MOVE = {

@@ -7,6 +7,43 @@
 // input: { move:{x,z} (-1..1, local to yaw), yaw, buttons (BTN bitmask) }
 import { WORLD, MOVE } from '../config/world.js';
 import { BTN } from '../net/protocol.js';
+import { MAP, COLLIDERS } from '../config/mapColliders.js';
+
+const STEP_HEIGHT = 0.55;   // max ledge the controller auto-steps onto
+
+// Resolve the player capsule (approximated as a vertical AABB of half-width
+// playerRadius and height playerHeight) against the solid map colliders.
+// Mutates s. Sets s.grounded when supported from below. Shared by client
+// prediction and server authority so both agree on collisions.
+function resolveColliders(s) {
+  const PR = WORLD.playerRadius;
+  const PH = WORLD.playerHeight;
+  for (let i = 0; i < COLLIDERS.length; i++) {
+    const c = COLLIDERS[i];
+    const pminX = s.x - PR, pmaxX = s.x + PR;
+    const pminZ = s.z - PR, pmaxZ = s.z + PR;
+    const pminY = s.y, pmaxY = s.y + PH;
+    if (pmaxX <= c.minX || pminX >= c.maxX) continue;
+    if (pmaxZ <= c.minZ || pminZ >= c.maxZ) continue;
+    if (pmaxY <= c.minY || pminY >= c.maxY) continue;
+
+    // step / stand-on-top: feet are at or just below the box top -> mount it
+    if (c.maxY - s.y <= STEP_HEIGHT && c.maxY - s.y > -0.001 && s.vy <= 0.001) {
+      s.y = c.maxY; s.vy = 0; s.grounded = true; continue;
+    }
+
+    // otherwise push out along the least-penetrated horizontal axis (a wall)
+    const penX = Math.min(pmaxX - c.minX, c.maxX - pminX);
+    const penZ = Math.min(pmaxZ - c.minZ, c.maxZ - pminZ);
+    if (penX <= penZ) {
+      s.x += s.x < (c.minX + c.maxX) * 0.5 ? -penX : penX;
+      s.vx = 0;
+    } else {
+      s.z += s.z < (c.minZ + c.maxZ) * 0.5 ? -penZ : penZ;
+      s.vz = 0;
+    }
+  }
+}
 
 function accelerate(vx, vz, dirx, dirz, wishSpeed, accel, dt) {
   const curSpeed = vx * dirx + vz * dirz;
@@ -58,14 +95,21 @@ export function stepMovement(s, input, dt) {
   s.y += s.vy * dt;
   s.z += s.vz * dt;
 
+  // re-derive ground support each tick (so walking off a ledge falls correctly)
+  s.grounded = false;
+
   // ground plane
   if (s.y <= WORLD.spawnY) { s.y = WORLD.spawnY; s.vy = 0; s.grounded = true; }
 
-  // arena bounds
-  if (s.x < -WORLD.arenaHalfX) { s.x = -WORLD.arenaHalfX; s.vx = 0; }
-  if (s.x > WORLD.arenaHalfX) { s.x = WORLD.arenaHalfX; s.vx = 0; }
-  if (s.z < -WORLD.arenaHalfZ) { s.z = -WORLD.arenaHalfZ; s.vz = 0; }
-  if (s.z > WORLD.arenaHalfZ) { s.z = WORLD.arenaHalfZ; s.vz = 0; }
+  // solid map cover (crates / pillars / walls) — server-authoritative
+  resolveColliders(s);
+
+  // outer arena bounds (map footprint)
+  const hx = MAP.halfX, hz = MAP.halfZ;
+  if (s.x < -hx) { s.x = -hx; s.vx = 0; }
+  if (s.x > hx) { s.x = hx; s.vx = 0; }
+  if (s.z < -hz) { s.z = -hz; s.vz = 0; }
+  if (s.z > hz) { s.z = hz; s.vz = 0; }
 
   return s;
 }

@@ -10,6 +10,7 @@ import { WEAPONS, COMBAT, computeDamage, REGION } from '../../shared/config/weap
 import { MATCH, PHASE } from '../../shared/config/match.js';
 import { OBJECTIVE } from '../../shared/config/objective.js';
 import { ECON } from '../../shared/config/economy.js';
+import { GRENADES, GRENADE_STARTER, THROW, freshGrenades } from '../../shared/config/grenades.js';
 import { aimDir, raycastPlayer } from '../../shared/combat/raycast.js';
 import { stepMovement } from '../../shared/movement/move.js';
 import { Player } from '../Player.js';
@@ -36,6 +37,11 @@ export class Room {
 
     // objective ("Breach Charge") state — owned by the server
     this.objective = this.freshObjective();
+
+    // grenade projectiles in flight + lingering area effects (smoke/fire)
+    this.projectiles = [];   // [{ id, kind, owner, team, x,y,z, vx,vy,vz, fuseAt, bornAt }]
+    this.effects = [];       // [{ id, kind, owner, team, x,z, radius, endsAt, lastTickAt }]
+    this._nadeId = 0;
 
     this.startedAt = Date.now();
     this._loop = null;
@@ -155,6 +161,8 @@ export class Room {
 
     this.updateRounds(now);
 
+    this.tickGrenades(dt, now);
+
     if (this.tick % SNAPSHOT_EVERY === 0) this.sendSnapshot();
   }
 
@@ -185,12 +193,15 @@ export class Room {
         p.weapon = ECON.startWeapon;
         p.armor = ECON.startArmor;
         p.helmet = false;
+        p.grenades = { ...GRENADE_STARTER };   // fresh utility for the new life
       }
       p.purchases = [];      // new buy phase -> refundable list resets
       p.spawn();
     }
     this.lastRoundWin = null;
     this.resetObjective();
+    this.projectiles.length = 0;   // no grenades carry between rounds
+    this.effects.length = 0;
     this.assignCarrier();
     this.setPhase(PHASE.BUY, MATCH.buyMs);
   }
@@ -551,6 +562,10 @@ export class Room {
   itemSpec(item) {
     if (item === 'armor') return { price: ECON.armorPrice, kind: 'armor' };
     if (item === 'armorhelmet') return { price: ECON.armorHelmetPrice, kind: 'armorhelmet' };
+    if (item.startsWith('nade_')) {
+      const g = GRENADES[item.slice(5)];
+      if (g) return { price: g.price, kind: 'grenade', nade: item.slice(5) };
+    }
     const w = WEAPONS[item];
     if (w && w.price !== undefined) return { price: w.price, kind: 'weapon' };
     return null;
@@ -566,6 +581,10 @@ export class Room {
     if (!this.buyableInPhase()) return this.sendTo(p, S2C.ECONOMY_UPDATE, { money: p.money, err: 'not buy phase' });
     const spec = this.itemSpec(d.item);
     if (!spec) return;
+    // grenade carry-limit check before charging
+    if (spec.kind === 'grenade' && p.grenades[spec.nade] >= GRENADES[spec.nade].max) {
+      return this.sendTo(p, S2C.ECONOMY_UPDATE, { money: p.money, err: 'grenade limit' });
+    }
     if (p.money < spec.price) return this.sendTo(p, S2C.ECONOMY_UPDATE, { money: p.money, err: 'too expensive' });
 
     p.money -= spec.price;
@@ -577,6 +596,8 @@ export class Room {
       p.armor = 100;
     } else if (spec.kind === 'armorhelmet') {
       p.armor = 100; p.helmet = true;
+    } else if (spec.kind === 'grenade') {
+      p.grenades[spec.nade] += 1;
     }
     p.purchases.push({ item: d.item, price: spec.price });
     this.sendTo(p, S2C.ECONOMY_UPDATE, { money: p.money, bought: d.item });
@@ -590,7 +611,10 @@ export class Room {
     p.money = Math.min(ECON.moneyCap, p.money + bought.price);
     // revert effect
     if (bought.item === 'armor' || bought.item === 'armorhelmet') { p.armor = 0; p.helmet = false; }
-    else if (WEAPONS[bought.item]) {
+    else if (bought.item.startsWith('nade_')) {
+      const k = bought.item.slice(5);
+      if (p.grenades[k] > 0) p.grenades[k] -= 1;
+    } else if (WEAPONS[bought.item]) {
       p.weapon = ECON.startWeapon;
       const w = WEAPONS[p.weapon];
       p.mag = w.mag; p.reserve = w.reserve;
@@ -607,6 +631,176 @@ export class Room {
     p.reloading = false;
   }
 
+  // ---- grenades (server-authoritative throw + physics + area effects) -----
+  // The client only asks to throw; the server owns the projectile, its bounce
+  // physics, the fuse, and every effect (frag damage, flash blind, smoke volume,
+  // fire DoT). d = { kind, soft }.
+  onThrow(id, d) {
+    const p = this.players.get(id);
+    if (!p || !p.alive || !d) return;
+    if (this.phase !== PHASE.LIVE && this.phase !== PHASE.WARMUP) return;
+    const kind = d.kind;
+    const g = GRENADES[kind];
+    if (!g || !p.grenades[kind] || p.grenades[kind] <= 0) return;
+    p.grenades[kind] -= 1;
+
+    const now = Date.now();
+    const dir = aimDir(p.yaw, p.pitch);
+    const speed = d.soft ? THROW.speedSoft : THROW.speedStrong;
+    const proj = {
+      id: ++this._nadeId, kind, owner: p.id, team: p.team,
+      x: p.x, y: p.y + COMBAT.eyeHeight, z: p.z,
+      vx: dir.x * speed, vy: dir.y * speed + THROW.upBias, vz: dir.z * speed,
+      fuseAt: now + g.fuseMs, bornAt: now, atRest: false,
+    };
+    this.projectiles.push(proj);
+    this.broadcast(S2C.GRENADE_EVENT, {
+      event: 'throw', id: proj.id, kind, by: p.id,
+      x: round2(proj.x), y: round2(proj.y), z: round2(proj.z),
+    });
+  }
+
+  // integrate every grenade projectile + age lingering effects. Called per tick.
+  tickGrenades(dt, now) {
+    for (let i = this.projectiles.length - 1; i >= 0; i--) {
+      const g = this.projectiles[i];
+      this.stepProjectile(g, dt);
+      if (now >= g.fuseAt || now - g.bornAt > THROW.maxLifeMs) {
+        this.detonate(g, now);
+        this.projectiles.splice(i, 1);
+      }
+    }
+    for (let i = this.effects.length - 1; i >= 0; i--) {
+      const e = this.effects[i];
+      if (e.kind === 'fire' && now - e.lastTickAt >= GRENADES.fire.tickMs) {
+        e.lastTickAt = now;
+        this.applyFireTick(e, now);
+      }
+      if (now >= e.endsAt) this.effects.splice(i, 1);
+    }
+  }
+
+  // simple projectile integration with floor + arena-wall bounces
+  stepProjectile(g, dt) {
+    g.vy -= WORLD.gravity * dt;
+    g.x += g.vx * dt; g.y += g.vy * dt; g.z += g.vz * dt;
+    const r = THROW.radius;
+    // floor
+    if (g.y <= r) {
+      g.y = r;
+      if (g.vy < 0) {
+        g.vy = -g.vy * THROW.restitution;
+        g.vx *= THROW.friction; g.vz *= THROW.friction;
+        this.broadcast(S2C.GRENADE_EVENT, { event: 'bounce', id: g.id, kind: g.kind, x: round2(g.x), y: round2(g.y), z: round2(g.z) });
+        if (g.vy < THROW.restSpeed) g.vy = 0;
+      }
+    }
+    // arena walls (reflect on x/z bounds)
+    const hx = WORLD.arenaHalfX - r, hz = WORLD.arenaHalfZ - r;
+    if (g.x > hx) { g.x = hx; g.vx = -g.vx * THROW.restitution; }
+    else if (g.x < -hx) { g.x = -hx; g.vx = -g.vx * THROW.restitution; }
+    if (g.z > hz) { g.z = hz; g.vz = -g.vz * THROW.restitution; }
+    else if (g.z < -hz) { g.z = -hz; g.vz = -g.vz * THROW.restitution; }
+  }
+
+  // a grenade reaches its fuse: apply its effect at its current position
+  detonate(g, now) {
+    const cfg = GRENADES[g.kind];
+    this.broadcast(S2C.GRENADE_EVENT, {
+      event: 'detonate', id: g.id, kind: g.kind,
+      x: round2(g.x), y: round2(g.y), z: round2(g.z), r: cfg.radius,
+    });
+    if (g.kind === 'frag') this.detonateFrag(g, cfg);
+    else if (g.kind === 'flash') this.detonateFlash(g, cfg, now);
+    else if (g.kind === 'smoke') this.deployEffect(g, cfg, now, 'smoke');
+    else if (g.kind === 'fire') this.deployEffect(g, cfg, now, 'fire');
+  }
+
+  detonateFrag(g, cfg) {
+    for (const t of this.players.values()) {
+      if (!t.alive) continue;
+      const dist = Math.hypot(t.x - g.x, t.z - g.z, (t.y + 0.9) - g.y);
+      if (dist > cfg.radius) continue;
+      const u = dist / cfg.radius;                       // 0 centre .. 1 edge
+      const scale = 1 - (1 - cfg.falloffMin) * u;
+      let dmg = cfg.damage * scale;
+      let armorLoss = 0;
+      if (t.armor > 0) {
+        const absorbed = dmg * (1 - cfg.armorPen) * 0.5;
+        dmg -= absorbed; armorLoss = Math.min(t.armor, Math.round(absorbed));
+      }
+      t.armor = Math.max(0, t.armor - armorLoss);
+      this.applyGrenadeDamage(g, t, Math.max(1, Math.round(dmg)));
+    }
+  }
+
+  // flash blind: stronger the closer you are and the more you face the flash
+  detonateFlash(g, cfg, now) {
+    for (const t of this.players.values()) {
+      if (!t.alive) continue;
+      const dx = g.x - t.x, dy = g.y - (t.y + COMBAT.eyeHeight), dz = g.z - t.z;
+      const dist = Math.hypot(dx, dy, dz);
+      if (dist > cfg.radius) continue;
+      // how directly is the victim looking at the flash? (1 = straight at it)
+      const view = aimDir(t.yaw, t.pitch);
+      const inv = 1 / (dist || 1);
+      const dot = view.x * dx * inv + view.y * dy * inv + view.z * dz * inv;
+      const facing = Math.max(0, dot);                   // 0 facing away .. 1 straight on
+      const prox = 1 - dist / cfg.radius;                // 0 edge .. 1 point blank
+      const strength = Math.min(1, (0.4 + 0.6 * facing) * prox + facing * 0.15);
+      const blindMs = cfg.minBlindMs + (cfg.maxBlindMs - cfg.minBlindMs) * strength;
+      const until = now + blindMs;
+      if (until > t.blindUntil) t.blindUntil = until;
+      this.sendTo(t, S2C.GRENADE_EVENT, { event: 'flash', durationMs: Math.round(blindMs), by: g.owner });
+    }
+  }
+
+  deployEffect(g, cfg, now, kind) {
+    const e = {
+      id: ++this._nadeId, kind, owner: g.owner, team: g.team,
+      x: g.x, z: g.z, radius: cfg.radius, endsAt: now + cfg.durationMs, lastTickAt: now,
+    };
+    this.effects.push(e);
+    this.broadcast(S2C.GRENADE_EVENT, {
+      event: kind, id: e.id, x: round2(e.x), z: round2(e.z), r: e.radius, durationMs: cfg.durationMs,
+    });
+  }
+
+  // incendiary DoT: damage anyone standing inside the fire this tick
+  applyFireTick(e, now) {
+    const cfg = GRENADES.fire;
+    const per = cfg.dps * (cfg.tickMs / 1000);
+    for (const t of this.players.values()) {
+      if (!t.alive) continue;
+      if (Math.hypot(t.x - e.x, t.z - e.z) > e.radius) continue;
+      this.applyGrenadeDamage({ owner: e.owner, team: e.team, kind: 'fire' }, t, Math.max(1, Math.round(per)));
+    }
+  }
+
+  // shared damage application for grenade sources (frag + fire) — handles death,
+  // kill credit, charge-drop and the kill feed, mirroring onFire's death block.
+  applyGrenadeDamage(src, victim, dmg) {
+    const wasAlive = victim.alive;
+    victim.hp -= dmg;
+    const killer = this.players.get(src.owner);
+    this.sendTo(victim, S2C.DAMAGE_EVENT, { victim: victim.id, amount: dmg, hp: victim.hp, armor: victim.armor, from: src.owner, region: 'body', src: src.kind });
+    if (wasAlive && victim.hp <= 0) {
+      victim.hp = 0; victim.alive = false;
+      victim.respawnAt = Date.now() + COMBAT.respawnMs;
+      victim.interacting = false;
+      if (victim.id === this.objective.carrier) this.dropCharge(victim);
+      victim.deaths += 1;
+      if (killer && killer.id !== victim.id && killer.team !== victim.team) {
+        killer.kills += 1;
+        killer.money = Math.min(ECON.moneyCap, killer.money + (ECON.killReward[killer.weapon] ?? ECON.killRewardDefault));
+      }
+      this.broadcast(S2C.DEATH_EVENT, {
+        killer: killer ? killer.id : null, killerName: killer ? killer.name : src.kind,
+        victim: victim.id, victimName: victim.name, weapon: src.kind, head: 0,
+      });
+    }
+  }
+
 
   sendSnapshot() {
     const snap = {
@@ -618,6 +812,12 @@ export class Room {
       pEnd: this.phaseEndsAt,
       winner: this.winner,
       obj: this.objectiveSnapshot(Date.now()),
+      nades: this.projectiles.map((g) => ({
+        id: g.id, k: g.kind, x: round2(g.x), y: round2(g.y), z: round2(g.z),
+      })),
+      fx: this.effects.map((e) => ({
+        id: e.id, k: e.kind, x: round2(e.x), z: round2(e.z), r: e.radius, end: e.endsAt,
+      })),
       players: [...this.players.values()].map((p) => p.toSnapshot()),
     };
     const msg = encode(S2C.MATCH_SNAPSHOT, snap);

@@ -4,6 +4,8 @@
 // copyrighted names/branding. Shared by server authority and the client UI so
 // both agree on site positions, radii, and timings.
 
+import { MAP_SITES } from './mapColliders.js';
+
 export const OBJECTIVE = {
   name: 'Breach Charge',
 
@@ -21,9 +23,6 @@ export const OBJECTIVE = {
   plantBonus: 300,
   defuseBonus: 300,
 
-  // two original arena breach sites (within WORLD arenaHalf 24 x 34)
-  sites: [
-    { id: 'A', name: 'Site Alpha', x: -13, z: -2, r: 5.0 },
-    { id: 'B', name: 'Site Bravo', x: 13, z: 6, r: 5.0 },
-  ],
+  // two original arena breach sites (placed on open, reachable map cells)
+  sites: MAP_SITES,
 };

@@ -3,6 +3,8 @@
 import { WORLD, SPAWN } from '../shared/config/world.js';
 import { HISTORY_MS } from '../shared/net/protocol.js';
 import { WEAPONS, DEFAULT_WEAPON } from '../shared/config/weapons.js';
+import { freshGrenades } from '../shared/config/grenades.js';
+import { MAP_SPAWNS } from '../shared/config/mapColliders.js';
 
 let _slot = 0;
 
@@ -34,6 +36,8 @@ export class Player {
     this.reloading = false;
     this.reloadDoneAt = 0;
     this.lastFireAt = 0;
+    this.grenades = freshGrenades();   // { frag, flash, smoke, fire } counts
+    this.blindUntil = 0;               // server-tracked flash blind expiry (ms)
 
     // stats
     this.kills = 0; this.deaths = 0; this.assists = 0;
@@ -54,11 +58,11 @@ export class Player {
   }
 
   spawn() {
-    const z = this.team === 'A' ? SPAWN.attackerZ : SPAWN.defenderZ;
-    const lane = (this.slot % 5) - 2; // -2..2 across five slots
-    this.x = lane * SPAWN.spread;
+    const pts = this.team === 'A' ? MAP_SPAWNS.A : MAP_SPAWNS.D;
+    const p = pts[this.slot % pts.length];
+    this.x = p.x;
     this.y = WORLD.spawnY;
-    this.z = z;
+    this.z = p.z;
     this.vx = this.vy = this.vz = 0;
     this.grounded = true;
     this.hp = 100;
@@ -70,6 +74,7 @@ export class Player {
     this.reloading = false;
     this.history.length = 0;
     this.interacting = false;
+    this.blindUntil = 0;
   }
 
   // record a hitbox-history sample for lag compensation, trimming old entries
@@ -104,6 +109,7 @@ export class Player {
       a: this.alive ? 1 : 0,
       k: this.kills, d: this.deaths,
       nm: this.name, mny: this.money,
+      g: [this.grenades.frag, this.grenades.flash, this.grenades.smoke, this.grenades.fire],
       seq: this.lastSeq, // so the client knows what input this state reflects
     };
   }
